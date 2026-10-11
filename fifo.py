@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 usage: fifo.py FIFO [TITLE] [-w, --wrap | --no-wrap] [-m, --mouse | --no-mouse]
+                            [-f, --follow REGEX]
 
 Keys:
   h/j/k/l or Arrows : ±10 cols/rows
@@ -8,14 +9,22 @@ Keys:
   PgUp/PgDn : ±1 page
   0/Home, $/End : line start/end
   g/G : top/bottom
-  w : toggle wrap | m : toggle mouse capture
+  w : toggle wrap | m : toggle mouse capture | f : toggle follow
 
 Mouse:
   Scroll wheel : vertical scroll (+Shift for horizontal)
   2-finger swipe : vertical scroll (+Shift for horizontal)
   Drag : select and copy text (via OSC 52; also tmux buffer if in tmux)
 
-Title format: "TITLE Y%,X%" (% of content edge reached; 100% = fully visible)
+Follow:
+  With --follow REGEX, every time new output arrives the viewer scrolls so the
+  first row matching REGEX (Python re.search on the visible text, colors
+  ignored) is centered vertically and horizontally visible. Matching is per
+  visual row, so in wrap mode a match can't span a wrap point.
+  Examples: --follow ►   --follow '^\s*►'   --follow '(?i)error'
+
+Title format: "TITLE [w|m|f] Y%,X%" (active modes; % of content edge reached;
+100% = fully visible)
 """
 
 import argparse
@@ -136,6 +145,7 @@ ACTION_KEYS = expand_keys(
         "G": "bottom",
         "w": "toggle_wrap",
         "m": "toggle_mouse",
+        "f": "toggle_follow",
     }
 )
 
@@ -205,6 +215,32 @@ def window_title_sequence(title):
 def percent_covered(edge, total):
     """How much of `total` is covered once the visible border reaches `edge`."""
     return min(100, round(100 * edge / total)) if total else 100
+
+
+def compile_follow(text):
+    """Compile the --follow regex, or exit on error."""
+    try:
+        return re.compile(text)
+    except re.error as error:
+        sys.exit(f"fifo.py: invalid --follow regex {text!r}: {error}")
+
+
+def find_match_column(cells, pattern):
+    """Terminal column where `pattern` first matches a row of cells, or None.
+
+    Cells are one per terminal column ("" is the second half of a wide
+    character, and a cell may hold a base character plus combining ones), so
+    a string index into the joined text must be mapped back to a cell index.
+    """
+    match = pattern.search("".join(cells))
+    if not match:
+        return None
+    seen = 0
+    for col, cell in enumerate(cells):
+        seen += len(cell)
+        if seen > match.start():
+            return col
+    return None
 
 
 def drain(fd):
@@ -447,7 +483,8 @@ class Content:
 
 
 class Viewer:
-    def __init__(self, title, wrap=True, mouse=True):
+    def __init__(self, title, wrap=True, mouse=True, follow=None):
+        """`follow` is a compiled regex whose first matching row is kept in view."""
         self.title = title
         self.wrap = wrap
         self.content = Content()
@@ -455,6 +492,9 @@ class Viewer:
         self.selection = None
         self.dragging = False  # left button is held down
         self.mouse_captured = mouse
+        self.follow_pattern = follow  # regex to keep in view, if any
+        self.following = follow is not None  # follow currently enabled
+        self._follow_pending = self.following  # scroll to the match on next draw
         self._pending_input = ""  # start of an escape sequence split across reads
         self._last_screen = None  # rows drawn last time, for diffing
         self._last_title = None
@@ -463,6 +503,7 @@ class Viewer:
 
     def feed(self, text):
         self.content.feed(text)
+        self._follow_pending = self.following
         if not self.dragging:
             self.selection = None
 
@@ -481,6 +522,17 @@ class Viewer:
         self.x = max(0, min(self.x, width - cols))
         self.y = max(0, min(self.y, len(rows) - height))
         return Layout(rows, width, cols, height)
+
+    def scroll_to_follow_match(self, layout):
+        """Center the first row matching the follow regex (if there is one)."""
+        for index, row in enumerate(layout.rows):
+            col = find_match_column(row.cells, self.follow_pattern)
+            if col is None:
+                continue
+            self.y = index - layout.height // 2
+            if not self.x <= col < self.x + layout.cols:
+                self.x = max(0, col - layout.cols // 2)
+            return
 
     # ---- selection ----------------------------------------------------------
 
@@ -594,11 +646,20 @@ class Viewer:
             self.mouse_captured = not self.mouse_captured
             self.selection, self.dragging = None, False
             write(MOUSE_ENABLE if self.mouse_captured else MOUSE_DISABLE)
+        elif action == "toggle_follow":
+            if self.follow_pattern:  # nothing to follow without --follow
+                self.following = not self.following
+                self._follow_pending = self.following  # jump right away
 
     # ---- drawing ------------------------------------------------------------
 
     def draw(self):
         layout = self.update_layout()
+        if self._follow_pending:
+            self._follow_pending = False
+            if self.follow_pattern:
+                self.scroll_to_follow_match(layout)
+                layout = self.update_layout()
         output = self._changed_rows(self._visible_rows(layout))
         output += self._changed_title(layout)
         if output:
@@ -633,8 +694,16 @@ class Viewer:
 
     def _changed_title(self, layout):
         """The OSC sequence updating the window title, if it changed."""
-        flags = ("[w]" if self.wrap else "") + ("[m]" if self.mouse_captured else "")
-        title = f"{self.title} {flags}" if flags else self.title
+        modes = "|".join(
+            flag
+            for flag, active in (
+                ("w", self.wrap),
+                ("m", self.mouse_captured),
+                ("f", self.following),
+            )
+            if active
+        )
+        title = f"{self.title} [{modes}]" if modes else self.title
 
         scrollable = (
             layout.content_width > layout.cols or len(layout.rows) > layout.height
@@ -755,12 +824,22 @@ def parse_args():
         help="capture mouse for scrolling/selection (default on; "
         "use --no-mouse to start with it released)",
     )
+    parser.add_argument(
+        "-f",
+        "--follow",
+        metavar="REGEX",
+        default=None,
+        help="on every update, scroll so the first row matching REGEX "
+        "(Python re.search, e.g. pwndbg's current-line marker) is centered; "
+        "toggle with the f key",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    viewer = Viewer(args.title, args.wrap, args.mouse)
+    follow = compile_follow(args.follow) if args.follow is not None else None
+    viewer = Viewer(args.title, args.wrap, args.mouse, follow)
     # O_RDWR so the FIFO never reports EOF when a writer closes it.
     fifo = os.open(args.fifo, os.O_RDWR | os.O_NONBLOCK)
     wake_read = wake_on_resize()

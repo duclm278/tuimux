@@ -39,7 +39,7 @@ def tmux(target, direction, size, title, cmd="cat -"):
     return pane
 
 
-def view(target, direction, size, title, wrap=True, mouse=True):
+def view(target, direction, size, title, wrap=True, mouse=True, follow=None):
     fifo = f"/tmp/view-{os.getpid()}-{title}.fifo"
     os.mkfifo(fifo)
     fifos.append(fifo)
@@ -48,6 +48,8 @@ def view(target, direction, size, title, wrap=True, mouse=True):
         cmd += " --no-wrap"
     if not mouse:
         cmd += " --no-mouse"
+    if follow:
+        cmd += f" --follow {follow}"
     pane = tmux(target, direction, size, title, cmd=cmd)
     pane.path = fifo
     pane.toggleable = True
@@ -70,10 +72,10 @@ def design():
     call(f'tmux select-pane -T "main" -t {ma_id}')
 
     L, D, U, R = "-hb", "-v", "-vb", "-h"
-    di = view(ma_id, U, "70%", "disasm")
+    di = view(ma_id, U, "70%", "disasm", follow="►")
     re = view(di.id, R, "50%", "regs")
     st = view(re.id, D, "35%", "stack")
-    ba = view(ma_id, R, "25%", "backtrace")
+    ba = view(ma_id, R, "25%", "backtrace", follow="►")
 
     mapping = {"regs": re, "legend": re, "disasm": di, "code": di, "stack": st, "backtrace": ba}
     for section, pane in mapping.items():
