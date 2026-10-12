@@ -39,7 +39,9 @@ def tmux(target, direction, size, title, cmd="cat -"):
     return pane
 
 
-def view(target, direction, size, title, wrap=True, mouse=True, follow=None):
+def view(
+    target, direction, size, title, wrap=True, mouse=True, follow=None, follow_mode=None
+):
     fifo = f"/tmp/view-{os.getpid()}-{title}.fifo"
     os.mkfifo(fifo)
     fifos.append(fifo)
@@ -50,6 +52,8 @@ def view(target, direction, size, title, wrap=True, mouse=True, follow=None):
         cmd += " --mouse"
     if follow:
         cmd += f" --follow {follow}"
+    if follow_mode:
+        cmd += f" --follow-mode {follow_mode}"
     pane = tmux(target, direction, size, title, cmd=cmd)
     pane.path = fifo
     pane.toggleable = True
