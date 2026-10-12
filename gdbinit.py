@@ -44,10 +44,10 @@ def view(target, direction, size, title, wrap=True, mouse=True, follow=None):
     os.mkfifo(fifo)
     fifos.append(fifo)
     cmd = f"{VIEW} {fifo} {title}"
-    if not wrap:
-        cmd += " --no-wrap"
-    if not mouse:
-        cmd += " --no-mouse"
+    if wrap:
+        cmd += " --wrap"
+    if mouse:
+        cmd += " --mouse"
     if follow:
         cmd += f" --follow {follow}"
     pane = tmux(target, direction, size, title, cmd=cmd)
