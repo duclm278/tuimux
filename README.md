@@ -1,23 +1,23 @@
 # tuimux
 
-A tmux-based TUI setup for [pwndbg](https://github.com/pwndbg/pwndbg). It splits your tmux window into dedicated panes and streams each pwndbg context section into its pane. Each pane is a small scrollable TUI viewer with line wrapping, mouse support, copy-on-select and text following.
+A customizable TUI+tmux setup for [pwndbg](https://github.com/pwndbg/pwndbg). It splits your tmux window into panes and streams each pwndbg context section into its own scrollable TUI viewer with wrapping, mouse, copy-on-select, search and follow support.
 
 ![Layout simple](assets/simple.png)
 
 ## Features
 
-- **Automatic layout.** Panes are created on the first prompt, and only when GDB is running inside tmux.
-- **A real viewer in every pane.** Scroll vertically and horizontally, toggle line wrap, and select text with the mouse. Colors (SGR) are preserved.
-- **Follow text.** On update, a pane can scroll so the first line matching a regex (like pwndbg's `►` line marker) stays centered.
-- **Flicker-free.** Output is redrawn in atomic, diffed updates and coalesced in short bursts, so fast `context` refreshes stay smooth.
+- **Automatic layout.** Panes are created on the first prompt, only when GDB runs inside tmux.
+- **A real viewer in every pane.** Scroll in both directions, toggle wrap, select text with the mouse. Colors (SGR) are preserved.
+- **Vim-like search.** `/` and `?` with incremental, regex matching, highlighted results and a `[i/n]` counter.
+- **Follow mode.** On update, a pane re-centers the first line matching a regex (like pwndbg's `►`).
 - **Clipboard integration.** Dragging copies via OSC 52 and into the tmux paste buffer.
-- **Pane navigation.** Alt+h/j/k/l, Alt+Arrows to navigate between panes, and Alt+z to zoom work without the tmux prefix.
-- **Clean teardown.** Panes, FIFOs and tmux options are removed when GDB exits.
-- **Customizable.** A layout is just a Python function, and the example configs include alternate layouts.
+- **Pane navigation.** Alt+h/j/k/l, Alt+Arrows and Alt+z work without the tmux prefix.
+- **Clean teardown.** Panes, FIFOs and tmux options are restored when GDB exits.
+- **Customizable.** A layout is just a Python function; example configs are included.
 
 ## Requirements
 
-- [pwndbg](https://pwndbg.re/stable/setup) (~/.gdbinit setup or pwndbg-gdb installer setup), started inside a tmux session
+- [pwndbg](https://pwndbg.re/stable/setup) (`~/.gdbinit` setup or pwndbg-gdb installer), started inside tmux
 - [tmux](https://github.com/tmux/tmux)
 
 ## Installation
@@ -27,7 +27,7 @@ git clone https://github.com/duclm278/tuimux
 echo "source $PWD/tuimux/gdbinit.py" >> ~/.gdbinit
 ```
 
-Your `~/.gdbinit` should look like this. Make sure tuimux is sourced **after** pwndbg loaded:
+Make sure tuimux is sourced **after** pwndbg:
 
 ```gdb
 # Only needed for ~/.gdbinit setup
@@ -38,81 +38,87 @@ set follow-fork-mode parent
 
 source /path/to/tuimux/gdbinit.py
 
-# Recommended if sections have separate panes, see "Follow text"
+# Recommended, see "Follow"
 # set context-disasm-lines 32
 # set context-code-lines 32
 set context-stack-lines 128
 set context-backtrace-lines 128
 ```
 
-Start `tmux`. Run `gdb ./binary` or `pwngdb ./binary` depending on your setup. The panes will appear when the first prompt is shown.
+Start `tmux`, then run `gdb ./binary` (or `pwngdb ./binary`). Panes appear at the first prompt.
 
-> **Note:** if pwndbg isn't importable, tuimux exits silently and does nothing. If no layout appears, check that pwndbg is sourced first.
+> If pwndbg isn't importable, tuimux exits silently. If no layout appears, check that pwndbg is sourced first.
 
 ## Usage
 
-### Pane viewer keys
+### Viewer keys
 
-Click or focus a pane and use:
+Click or focus a pane, then:
 
 | Key | Action |
 | --- | --- |
-| `h` `j` `k` `l` or Arrows | Scroll by 10 columns or rows |
-| `H` `J` `K` `L` or Shift+Arrows | Scroll by 20 columns or rows |
-| `PgUp` / `PgDn` | Scroll by one page |
-| `0` / `Home`, `$` / `End` | Jump to line start / end |
-| `g` / `G` | Jump to top / bottom |
+| `h` `j` `k` `l` / Arrows | Scroll 10 columns or rows |
+| `H` `J` `K` `L` / Shift+Arrows | Scroll 20 columns or rows |
+| `PgUp` `PgDn` | Scroll one page |
+| `0` / `Home`, `$` / `End` | Line start / end |
+| `g` , `G` | Top / bottom |
+| `/` , `?` | Search down / up (regex) |
+| `n` , `N` | Next / previous match |
+| `Esc` | Cancel the search prompt, or clear highlights |
 | `w` | Toggle line wrap |
 | `f` | Toggle follow (panes with follow only) |
-| `m` | Toggle mouse capture (to forward mouse events to tmux) |
+| `m` | Toggle mouse capture (release it to use the terminal's native selection) |
 
-**Mouse:** the scroll wheel or a two-finger swipe scrolls vertically (hold Shift for horizontal). Dragging selects text and copies it on release.
+**Mouse:** the wheel or a two-finger swipe scrolls vertically (hold Shift for horizontal). Dragging selects and copies on release.
 
-Each pane's title shows its state and edge position, for example `disasm [w|m|f] 64%,100%`. `[w]`, `[m]` and `[f]` mean wrap, mouse capture and follow are on. The percentages show how much of the content's bottom and right edge is visible, where 100% means fully visible.
+### Search
 
-### Follow text
+- `/` or `?` opens a prompt at the bottom. Matches are found as you type; `Enter` accepts, `Esc` cancels. An empty `Enter` repeats the last search.
+- Patterns are Python regexes. Matches are highlighted, the current one in orange, and the corner shows `[i/n]`.
 
-A pane created with `follow="REGEX"` re-centers the first matching line every time new output arrives, vertically and horizontally. The default layout follows `►` in `disasm` and `backtrace`, so the current instruction and frame stay in the middle as you step.
+### Follow
 
-- Press `f` to pause or resume. Following also overrides manual scrolling on the next update, so pause it when you want to look around.
-- Matching is `re.search` per visual row, colors ignored. Examples: `►`, `^\s*►`, `(?i)error`.
+A pane created with `follow="REGEX"` re-centers a matching line on every update. The default layout follows `►` in `disasm` and `backtrace`, so the current instruction and frame stay in the middle as you step.
 
-**Tip: set `context-<section>-lines` to a high number.** The viewer scrolls, so there is no need to keep context short. With a large window of lines, you can scroll freely around the current instruction, stack or call chain, while follow keeps `►` in the middle:
+- `f` pauses or resumes follow. Follow overrides manual scrolling on the next update, so pause it to look around.
+- **Hint:** if scrolling makes you lose focus on the current line, press `ff` to pause and resume, which re-centers it.
+- Matching ignores colors. Examples: `►`, `^\s*►`, `(?i)error`.
+- Standalone `fifo.py` also takes `--follow-mode`: `buffer` (default, first match in the whole unwrapped text, may span lines), `line` (first matching line, faster) or `last` (last matching line, fastest).
 
-```gdb
-set context-disasm-lines 32
-set context-code-lines 32
-set context-stack-lines 128
-set context-backtrace-lines 128
-```
+**Tip:** set `context-<section>-lines` high. The viewer scrolls, so you can browse freely around the current instruction, stack or call chain while follow keeps `►` centered.
+
+### Status display
+
+- **Title:** `disasm 64%,100%` shows how much of the content's bottom and right edge is visible (100% = fully visible). Hidden when everything fits.
+- **Corner (bottom right):** active flags `f` (follow), `m` (mouse capture), `w` (wrap), shown for about 2 seconds after start or a toggle (`-` means none), plus the search position `[i/n]` while highlights are on.
 
 ### tmux bindings
 
-tuimux adds these root-table bindings (no prefix needed):
+Root-table bindings (no prefix needed):
 
 | Key | Action |
 | --- | --- |
-| `Alt+h/j/k/l` or `Alt+Arrows` | Move between panes |
-| `Alt+z` | Zoom or unzoom the current pane |
+| `Alt+h/j/k/l` / `Alt+Arrows` | Move between panes |
+| `Alt+z` | Zoom or unzoom the pane |
 
-It also turns on `mouse` and `pane-border-status top` for tmux. The pane border status is switched off again on exit.
+tuimux also turns on `mouse` and `pane-border-status top`, and switches the latter off on exit.
 
 ### GDB command
 
-- In GDB, use the command `wrap` to toggle wrapping in all panes at once.
+`wrap` toggles wrapping in all viewer panes at once.
 
 ## Layouts
 
-The layout lives in a `design()` function. Redefining it in your ~/.gdbinit **after** sourcing `tuimux/gdbinit.py` replaces the default. Four examples are included.
+The layout lives in `design()`. Redefine it in your `~/.gdbinit` **after** sourcing `tuimux/gdbinit.py` to replace the default.
 
 | File | Description |
 | --- | --- |
 | `simple.gdbinit` | Default layout |
-| `simple-code.gdbinit` | Default layout plus a separate `code` pane (source view) |
-| `splitmind.gdbinit` | A [splitmind](https://github.com/jerdna-regeiz/splitmind)-style layout with extra input/output and ipython panes |
-| `splitmind-code.gdbinit` | The splitmind layout plus a separate `code` pane |
+| `simple-code.gdbinit` | Default plus a separate `code` pane |
+| `splitmind.gdbinit` | [splitmind](https://github.com/jerdna-regeiz/splitmind)-style layout with input/output and ipython panes |
+| `splitmind-code.gdbinit` | Splitmind layout plus a `code` pane |
 
-The `simple` (default) layout looks like this:
+Default (`simple`):
 
 ```txt
 ┌───────────────────────┬───────────────────────┐
@@ -124,7 +130,7 @@ The `simple` (default) layout looks like this:
 └───────────────────────────────────┴───────────┘
 ```
 
-The `simple-code` layout looks like this:
+`simple-code`:
 
 ```txt
 ┌───────────────────────┬───────────────────────┐
@@ -137,7 +143,7 @@ The `simple-code` layout looks like this:
 └───────────────────────────────────┴───────────┘
 ```
 
-The `splitmind` layout looks like this:
+`splitmind`:
 
 ```txt
 ┌───────────┬───────────────────────┬───────────┐
@@ -151,11 +157,9 @@ The `splitmind` layout looks like this:
 └───────────────────────────────────┴───────────┘
 ```
 
-Demo:
-
 ![Layout splitmind](assets/splitmind.png)
 
-The `splitmind-code` layout looks like this:
+`splitmind-code`:
 
 ```txt
 ┌───────────┬───────────────────────┬───────────┐
@@ -170,22 +174,20 @@ The `splitmind-code` layout looks like this:
 └───────────────────────────────────┴───────────┘
 ```
 
-Demo:
-
 ![Layout splitmind-code](assets/splitmind-code.png)
 
-The `code` layouts give source its own pane (also with follow), so disasm and source are visible side by side vertically. They are meant to be used with the high `context-*-lines` values above. The input/output pane prints its tty. In GDB shell, run `tty /dev/pts/<num>` to redirect the binary's input/output to that pane.
+The `code` layouts give source its own pane (also with follow) and work best with the high `context-*-lines` values above. The input/output pane prints its tty; in GDB run `tty /dev/pts/<num>` to redirect the binary's I/O there.
 
 ### Writing your own
 
-Inside `design()` you have two helpers:
+`design()` has two helpers:
 
 ```python
-view(target, direction, size, title, wrap=True, mouse=True, follow=None)  # a viewer pane fed by a FIFO
+view(target, direction, size, title, wrap=True, mouse=True, follow=None)  # viewer pane fed by a FIFO
 tmux(target, direction, size, title, cmd="cat -")                         # any command in a plain pane
 ```
 
-Both split the pane `target` and return a pane object with `.id` and `.path`. The directions are `-hb` (left), `-v` (down), `-vb` (up) and `-h` (right), and `size` is a tmux `-l` value such as `"30%"` or `"25"`. `follow` is a regex to keep centered (e.g. `"►"`). Then map pwndbg context sections to panes:
+Both split pane `target` and return a pane with `.id` and `.path`. Directions: `-hb` (left), `-v` (down), `-vb` (up), `-h` (right). `size` is a tmux `-l` value like `"30%"` or `"25"`. `follow` is a regex to keep centered. Then map pwndbg sections to panes:
 
 ```python
 def design():
@@ -201,51 +203,52 @@ def design():
         contextoutput(section, pane.path, clearing=True, banner="none")
 ```
 
-The above example creates a disasm pane above the main pane, a code pane below disasm, and a stack pane to the right of disasm. The `contextoutput()` calls redirect the context sections into the matching pane paths.
+This puts disasm above the main pane, code below disasm, and stack to the right of disasm. Sections can share a pane (as `regs`/`legend` and `disasm`/`code` do in the default layout). Use `tmux()` for panes that don't need the viewer (see `splitmind.gdbinit`).
 
-Sections can share the same pane (like "disasm" and "code" both using one pane in the default layout). You can use `tmux()` to create panes that don't need the features of the FIFO viewer (see `splitmind.gdbinit` for an example).
-
-The sections pwndbg offers include `regs`, `legend`, `disasm`, `code`, `stack`, `backtrace`, `expressions` and `ghidra`. Any section you don't map stays in the main GDB pane.
+See [pwndbg's docs](https://pwndbg.re/stable/configuration/config/#context-sections) for available sections. Unmapped sections stay in the main GDB pane.
 
 ## How it works
 
-1. `gdbinit.py` waits for the first GDB prompt, then runs `init()`. User can override anything functions like `design()` and `init()` to customize the logic.
-2. For each viewer pane it creates a named FIFO at `/tmp/view-<pid>-<title>.fifo` and splits a tmux pane running `fifo.py <fifo> <title>`.
-3. pwndbg's `contextoutput` redirects each context section into the matching FIFO.
-4. `fifo.py` reads the FIFO, treats a clear-screen sequence as the start of a new frame, and redraws the pane. It sanitizes escape sequences, keeps colors, handles wide Unicode characters, and supports selection, scrolling and follow.
-5. On exit, the `atexit` handlers kill the panes, delete the FIFOs and restore tmux settings.
+1. `gdbinit.py` waits for the first GDB prompt, then runs `init()`. You can override `design()` and `init()`.
+2. Each viewer pane gets a FIFO at `/tmp/view-<pid>-<title>.fifo` and runs `fifo.py <fifo> <title>`.
+3. pwndbg's `contextoutput` redirects each section into its FIFO.
+4. `fifo.py` treats a clear-screen sequence as a new frame and redraws the pane, handling escape sequences, colors, wide characters, selection, scrolling, search and follow.
+5. On exit, `atexit` handlers kill the panes, delete the FIFOs and restore tmux settings.
 
-`fifo.py` can also be used on its own:
+`fifo.py` also works standalone:
 
 ```sh
 mkfifo /tmp/demo.fifo
-python3 fifo.py /tmp/demo.fifo demo --no-wrap --follow '►'
+python3 fifo.py /tmp/demo.fifo demo --follow '►' --wrap --mouse
 
 # in another terminal
 echo hello > /tmp/demo.fifo
 ```
 
+Options: `-f/--follow REGEX`, `--follow-mode {buffer,line,last}`, `-m/--mouse`, `-w/--wrap` (all off by default).
+
 ## Files
 
 ```
-gdbinit.py              GDB entry point to create panes and wire up pwndbg
+gdbinit.py              GDB entry point: creates panes, wires up pwndbg
 fifo.py                 Standalone FIFO viewer used in each pane
-simple.gdbinit          Example config, default layout
-simple-code.gdbinit     Example config, default layout with code pane
-splitmind.gdbinit       Example config, splitmind-style layout
-splitmind-code.gdbinit  Example config, splitmind-style layout with code pane
+simple.gdbinit          Default layout
+simple-code.gdbinit     Default layout with code pane
+splitmind.gdbinit       Splitmind-style layout
+splitmind-code.gdbinit  Splitmind-style layout with code pane
 ```
 
 ## Troubleshooting
 
-- **Nothing happens.** GDB must be started inside tmux (`$TMUX` and `$TMUX_PANE` must be set), and pwndbg must be loaded before tuimux.
-- **Can't select text with the terminal's native selection.** Press `m` in the pane to release the mouse capture.
-- **Can't scroll, the view keeps jumping back.** Follow is on. Press `f` in the pane to pause it.
-- **Stale FIFOs after a crash.** Delete them with `rm /tmp/view-*.fifo`.
-- **warning: GDB: Failed to set controlling terminal: Operation not permitted.** Just ignore it. It also happens with [splitmind](https://github.com/jerdna-regeiz/splitmind).
+- **Nothing happens.** GDB must run inside tmux (`$TMUX` and `$TMUX_PANE` set), with pwndbg loaded first.
+- **Can't select text with the terminal's native selection.** Press `m` in the pane.
+- **Can't scroll, the view keeps jumping back.** Follow is on. Press `f` to pause it.
+- **Lost the current line after scrolling.** If `f` is still on, press `ff` to re-center it.
+- **Stale FIFOs after a crash.** `rm /tmp/view-*.fifo`
+- **warning: GDB: Failed to set controlling terminal: Operation not permitted.** Ignore it; [splitmind](https://github.com/jerdna-regeiz/splitmind) recommends the same.
 
 ## Acknowledgements
 
-- [kittydbg](https://github.com/k4lizen/kittydbg): A gdbinit configuration that uses kitty tiling to take better advantage of the empty space present in the pwndbg output.
-- [pwnmux](https://github.com/joaogodinho/pwnmux): A gdbinit configuration that uses pwndbg and tmux to create multiple panes for different contexts, making debugging a more enjoyable experience.
-- [splitmind](https://github.com/jerdna-regeiz/splitmind): A python module that helps to setup a layout of splits to organize presented information.
+- [kittydbg](https://github.com/k4lizen/kittydbg): gdbinit config using kitty tiling to use the empty space in pwndbg output.
+- [pwnmux](https://github.com/joaogodinho/pwnmux): pwndbg and tmux config with multiple panes for different contexts.
+- [splitmind](https://github.com/jerdna-regeiz/splitmind): Python module to set up a layout of splits for presented information.
