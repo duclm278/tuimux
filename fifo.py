@@ -13,7 +13,7 @@ usage: fifo.py FIFO [TITLE] [-f REGEX] [--follow-mode MODE] [-m] [-w]
 Keys: hjkl/arrows ±10, HJKL/Shift+arrows ±20, PgUp/PgDn, 0/Home, $/End,
       g/G top/bottom, f/m/w toggle follow/mouse/wrap
       / ? search down/up (incremental; Enter accepts, Esc cancels), n/N next/prev,
-      Esc clears the highlight (searching pauses follow)
+      Esc clears the highlight
 Scroll: vertical, +Shift horizontal
 Title: TITLE Y%,X% (% of content reached; 100% = fully visible)
 Corner: active flags (briefly after start or a toggle), search position [i/n]
@@ -548,11 +548,6 @@ class Viewer:
 
     # ---- search -------------------------------------------------------------
 
-    def _pause_follow(self):
-        if self.following:
-            self.following = self._follow_pending = False
-            self._show_flags()
-
     def _search_origin(self, forward):
         """Where a search starts: the current match, else the top visible row."""
         if self.match:
@@ -569,13 +564,11 @@ class Viewer:
 
     def _step(self, forward):
         if self.search_pattern:
-            self._pause_follow()
             self.highlighting = True
             origin = self._search_origin(forward)
             self._go(self.content.search(self.search_pattern, *origin, forward))
 
     def _start_search(self, forward):
-        self._pause_follow()
         self.search_input, self.forward = "", forward
         self._saved = (self.y, self.x, self.match)
         self._origin = self._search_origin(forward)
