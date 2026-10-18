@@ -6,5 +6,4 @@ set follow-fork-mode parent
 
 # Make sure you source tuimux after pwndbg is loaded
 source /path/to/tuimux/gdbinit.py
-set context-backtrace-lines 128
-set context-stack-lines 128
+tuimux layout simple -y
