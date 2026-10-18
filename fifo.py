@@ -40,7 +40,7 @@ from typing import NamedTuple
 
 STDIN = 0
 STEP_SMALL, STEP_LARGE = 10, 20  # keyboard scroll steps
-WHEEL_X, WHEEL_Y = 6, 3  # scroll per wheel tick
+WHEEL_X, WHEEL_Y = 4, 2  # scroll per wheel tick
 FAR = 1 << 32  # clamped when applied
 BURST_DELAY = 0.016  # max wait before drawing FIFO data
 FLAGS_TIMEOUT = 2.0  # seconds the corner flags stay visible
