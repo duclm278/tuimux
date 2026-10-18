@@ -40,7 +40,7 @@ def tmux(target, direction, size, title, cmd="cat -"):
 
 
 def view(
-    target, direction, size, title, wrap=True, mouse=True, follow=None, follow_mode=None
+    target, direction, size, title, follow=None, follow_mode=None, mouse=True, wrap=False
 ):
     fifo = f"/tmp/view-{os.getpid()}-{title}.fifo"
     os.mkfifo(fifo)
