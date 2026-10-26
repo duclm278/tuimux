@@ -1,31 +1,43 @@
 #!/usr/bin/env python3
-"""Terminal viewer for a FIFO.
+"""Terminal viewer for a FIFO or a PTY.
 
-usage: fifo.py FIFO [TITLE] [-f REGEX] [--follow-mode MODE] [-m] [-w]
+usage: viewer.py PATH [TITLE] [-f REGEX] [--follow-mode MODE] [--follow-live]
+                 [-m] [-w] [-s DIR] [-t]
 
   -f, --follow REGEX  on update, center a match of REGEX (colors ignored)
   --follow-mode MODE  buffer: first match in the whole unwrapped text, may span
                       lines (default); line: first matching line, faster;
                       last: last matching line, scanned from the end, fastest
+  --follow-live       leave history when a new frame arrives
   -m, --mouse         capture mouse: wheel scroll, drag to copy (OSC 52 / tmux)
   -w, --wrap          wrap long lines
+  -s, --sync DIR      sync states with sibling viewers
+  -t, --tty           create a PTY and link PATH to it instead of reading a FIFO;
+                      writers (isatty, TIOCGWINSZ) see this terminal's size
 
 Keys: hjkl/arrows ±10, HJKL/Shift+arrows ±20, PgUp/PgDn, 0/Home, $/End,
-      g/G top/bottom, f/m/w toggle follow/mouse/wrap
-      / ? search down/up (incremental; Enter accepts, Esc cancels), n/N next/prev,
+      g, G top/bottom, f/m/w toggle follow/mouse/wrap
+      [, ] older/newer history frame, {, } oldest/live (newest)
+      /, ? search down/up (incremental; Enter accepts, Esc cancels), n, N next/prev,
       Esc clears the highlight
 Scroll: vertical, +Shift horizontal
 Title: TITLE Y%,X% (% of content reached; 100% = fully visible)
-Corner: active flags (briefly after start or a toggle), search position [i/n]
+Corner: active flags (briefly), search position [i/n], history position i/n
+        while browsing
 """
 
 import argparse
 import base64
 import codecs
+import fcntl
+import json
 import os
+import pty
 import re
 import select
 import signal
+import socket
+import struct
 import subprocess
 import sys
 import termios
@@ -36,6 +48,7 @@ from bisect import bisect_left, bisect_right
 from contextlib import contextmanager, suppress
 from functools import cache
 from itertools import accumulate, islice
+from pathlib import Path
 from typing import NamedTuple
 
 STDIN = 0
@@ -49,6 +62,8 @@ MAX_RAW = 8 << 20  # retained input cap when there are no frame markers
 FRAME_OVERLAP = 16  # rescan window for a split frame marker
 MAX_COUNT = 999  # search matches counted for [i/n]
 TAB_WIDTH = 8
+HISTORY_MAX_FRAMES = 200  # sealed frames kept per viewer
+HISTORY_MAX_BYTES = 64 << 20  # raw text kept across all sealed frames
 
 SGR_RESET, SGR_INVERT = "\x1b[0m", "\x1b[7m"
 STYLE_MATCH, STYLE_CURRENT = "\x1b[30;43m", "\x1b[30;48;5;208m"  # like nvim hlsearch
@@ -116,6 +131,10 @@ ACTION_KEYS = expand_keys(  # key -> Viewer method name
         "f": "toggle_follow",
         "m": "toggle_mouse",
         "w": "toggle_wrap",
+        "[": "history_prev",
+        "]": "history_next",
+        "{": "history_first",
+        "}": "history_live",
     }
 )
 
@@ -186,6 +205,23 @@ def drain(fd):
         data += chunk
 
 
+def sync_pty_size(master):
+    """Give the PTY our terminal's size, so writers can lay out for it."""
+    cols, rows = terminal_size()
+    fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+
+
+def open_pty(path):
+    """Create a raw PTY, link `path` to its worker and return the master."""
+    master, worker = pty.openpty()  # the worker stays open: writers never see a hangup
+    tty.setraw(worker)
+    os.set_blocking(master, False)
+    sync_pty_size(master)
+    Path(path).unlink(missing_ok=True)
+    os.symlink(os.ttyname(worker), path)
+    return master
+
+
 def render_row(tokens, first_col, width, highlight=()):
     """Render columns [first_col, first_col + width) of a token row.
 
@@ -220,6 +256,66 @@ def render_row(tokens, first_col, width, highlight=()):
         if col >= last_col:
             break
     return "".join(out) + SGR_RESET
+
+
+# ---- control socket ---------------------------------------------------------
+
+
+class Peers:
+    """Datagram socket shared by a group of synchronized viewers.
+
+    Every viewer binds DIR/NAME.sock; a message goes to all other *.sock files
+    in DIR. Without -s/--sync (or if binding fails), it is a silent no-op.
+    """
+
+    def __init__(self, directory=None, name=""):
+        self.directory = Path(directory) if directory else None
+        self.path, self.sock = None, None
+        if not directory:
+            return
+        path = self.directory / (re.sub(r"[^\w.-]", "_", name) + ".sock")
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+            path.unlink(missing_ok=True)
+            sock.bind(str(path))
+            sock.setblocking(False)
+        except OSError:
+            return
+        self.path, self.sock = path, sock
+
+    def fileno(self):
+        return self.sock.fileno() if self.sock else None
+
+    def send(self, message):
+        """Send to every other viewer in the session."""
+        if not self.sock:
+            return
+        data = json.dumps(message).encode()
+        for path in self.directory.glob("*.sock"):
+            if path != self.path:
+                with suppress(OSError):  # peer gone or its queue is full
+                    self.sock.sendto(data, str(path))
+
+    def receive(self):
+        """Yield every pending message (a dict); malformed ones are skipped."""
+        while self.sock:
+            try:
+                data = self.sock.recv(65536)
+            except OSError:  # nothing left (EAGAIN)
+                return
+            try:
+                message = json.loads(data)
+            except ValueError:
+                continue
+            if isinstance(message, dict):
+                yield message
+
+    def close(self):
+        if self.sock:
+            self.sock.close()
+            with suppress(OSError):
+                self.path.unlink()
+            self.sock = None
 
 
 # ---- data types -------------------------------------------------------------
@@ -274,6 +370,30 @@ class Selection:
         )
 
 
+class History:
+    """Completed frames keyed by number, oldest evicted first."""
+
+    def __init__(self, max_frames=HISTORY_MAX_FRAMES, max_bytes=HISTORY_MAX_BYTES):
+        self.max_frames, self.max_bytes = max_frames, max_bytes
+        self.frames = {}  # frame number -> raw text
+        self.ids = []  # sorted
+        self.size = 0
+
+    def seal(self, frame_id, raw):
+        """Store a completed frame."""
+        self.ids.append(frame_id)
+        self.frames[frame_id] = raw
+        self.size += len(raw)
+        while len(self.ids) > 1 and (
+            len(self.ids) > self.max_frames or self.size > self.max_bytes
+        ):
+            self.size -= len(self.frames.pop(self.ids.pop(0)))
+
+    def position(self, frame_id):
+        """1-based index of an existing frame."""
+        return bisect_left(self.ids, frame_id) + 1
+
+
 # ---- content: raw text -> lines -> visual rows ------------------------------
 
 
@@ -293,22 +413,33 @@ class Content:
     def feed(self, text):
         scan_from = max(0, len(self.raw) - FRAME_OVERLAP)
         self.raw += text
-        last = None
-        for last in FRAME_START.finditer(self.raw, scan_from):
-            pass
-        if last:
-            self._discard(last.end())
+        starts = list(FRAME_START.finditer(self.raw, scan_from))
+        completed = []
+        if starts:
+            begin = 0
+            for start in starts:
+                completed.append(self.raw[begin : start.start()])
+                begin = start.end()
+            self._discard(begin)
         elif len(self.raw) > MAX_RAW:  # keep the newest half
             cut = len(self.raw) - MAX_RAW // 2
             newline = self.raw.find("\n", cut)
             self._discard(newline + 1 if newline >= 0 else cut)
         self._dirty = True
         self.version += 1
+        return completed
 
     def _discard(self, upto):
         self.raw = self.raw[upto:]
         self._done, self._done_end = [], 0
         self.epoch += 1
+
+    def load(self, raw):
+        """Replace the whole text (a sealed frame)."""
+        self.raw = raw
+        self._discard(0)
+        self._dirty = True
+        self.version += 1
 
     def rows(self, cols, wrap):
         self._parse()
@@ -439,7 +570,14 @@ class Content:
 
 class Viewer:
     def __init__(
-        self, title, follow=None, follow_mode="buffer", mouse=False, wrap=False
+        self,
+        title,
+        follow=None,
+        follow_mode="buffer",
+        follow_live=False,
+        mouse=False,
+        wrap=False,
+        peers=None,
     ):
         """`follow` is a compiled regex whose first matching row stays in view."""
         self.title = title
@@ -448,7 +586,13 @@ class Viewer:
         self.follow_mode = follow_mode
         self.mouse_captured = mouse
         self.wrap = wrap
-        self.content = Content()
+        self.live = Content()  # receives everything the FIFO delivers
+        self.past = Content()  # the sealed frame shown while browsing history
+        self.history = History()
+        self.frame = 0  # current frame number; clear-screen starts frame 1
+        self.cursor = None  # past frame shown; None = live
+        self.peers = peers or Peers()
+        self.follow_live = follow_live
         self.x = self.y = 0  # first visible column / row
         self.selection = None
         self.dragging = False
@@ -469,13 +613,97 @@ class Viewer:
         self._origin = (0, 0)  # (line, col) the typed search starts from
         self._flags_until = time.monotonic() + FLAGS_TIMEOUT  # corner flags deadline
 
+    @property
+    def content(self):
+        return self.live if self.cursor is None else self.past
+
     def feed(self, text):
-        self.content.feed(text)
+        completed = self.live.feed(text)
+        for raw in completed:
+            if self.frame:
+                self.history.seal(self.frame, raw)
+            self.frame += 1
+        if completed and self.cursor is not None and self.follow_live:
+            self._show(None)
+        if self.cursor is not None and self.cursor not in self.history.frames:
+            oldest = self.history.ids[0] if self.history.ids else None
+            self._show(oldest, force=True)
+        if self.cursor is not None:  # browsing: the live frame fills in unseen
+            return
         self._follow_pending = self.following
-        if self.match and self._match_epoch != self.content.epoch:
+        if self.match and self._match_epoch != self.live.epoch:
             self.match = None  # its line no longer exists
         if not self.dragging:
             self.selection = None
+
+    # ---- history ------------------------------------------------------------
+
+    def _current_id(self):
+        if self.cursor is not None:
+            return self.cursor
+        return self.frame or None
+
+    def _show(self, target, force=False):
+        if target == self.cursor and not force:
+            return False
+        self.cursor = target
+        if target is not None:
+            self.past.load(self.history.frames[target])
+        self.match, self.selection, self.dragging = None, None, False
+        self._saved = (*self._saved[:2], None)
+        self._follow_pending = self.following
+        self._flags_until = None
+        return True
+
+    def _move_history(self, action, broadcast=True):
+        frames = [*self.history.ids, self.frame] if self.frame else []
+        if frames:
+            index = bisect_left(frames, self._current_id())
+            index = {
+                "prev": index - 1,
+                "next": index + 1,
+                "first": 0,
+                "live": len(frames) - 1,
+            }[action]
+            target = frames[min(max(index, 0), len(frames) - 1)]
+            self._show(None if target == self.frame else target)
+        if broadcast:
+            self.peers.send({"op": "history", "action": action})
+
+    def history_prev(self):
+        self._move_history("prev")
+
+    def history_next(self):
+        self._move_history("next")
+
+    def history_first(self):
+        self._move_history("first")
+
+    def history_live(self):
+        self._move_history("live")
+
+    # ---- control messages ---------------------------------------------------
+
+    def _announce(self, prop, value):
+        self.peers.send({"op": "set", "name": prop, "value": value})
+
+    def handle_message(self, message):
+        """Apply a history move or viewer toggle from a sibling."""
+        if message.get("op") == "history" and message.get("action") in (
+            "prev",
+            "next",
+            "first",
+            "live",
+        ):
+            self._move_history(message["action"], broadcast=False)
+        elif message.get("op") == "set":
+            setter = {
+                "follow": self._set_follow,
+                "mouse": self._set_mouse,
+                "wrap": self._set_wrap,
+            }.get(message.get("name"))
+            if setter:
+                setter(bool(message.get("value")))
 
     def invalidate(self):
         """Force a full redraw (e.g. after a resize)."""
@@ -702,20 +930,38 @@ class Viewer:
 
     def toggle_follow(self):
         if self.follow_pattern:
-            self.following = self._follow_pending = not self.following
-            self._show_flags()
+            self._set_follow(not self.following)
+            self._announce("follow", self.following)
+
+    def _set_follow(self, value):
+        if not self.follow_pattern or value == self.following:
+            return
+        self.following = self._follow_pending = value
+        self._show_flags()
 
     def toggle_mouse(self):
-        self.mouse_captured = not self.mouse_captured
+        self._set_mouse(not self.mouse_captured)
+        self._announce("mouse", self.mouse_captured)
+
+    def _set_mouse(self, value):
+        if value == self.mouse_captured:
+            return
+        self.mouse_captured = value
         self.selection, self.dragging = None, False
         write(MOUSE_ENABLE if self.mouse_captured else MOUSE_DISABLE)
         self._show_flags()
 
     def toggle_wrap(self):
+        self._set_wrap(not self.wrap)
+        self._announce("wrap", self.wrap)
+
+    def _set_wrap(self, value):
+        if value == self.wrap:
+            return
         # Keep the top visible logical line in place across re-wrapping.
         layout = self.update_layout()
         top_line = layout.rows[self.y].line if self.y < len(layout.rows) else 0
-        self.wrap, self.x, self.selection = not self.wrap, 0, None
+        self.wrap, self.x, self.selection = value, 0, None
         rows = self.content.rows(layout.cols, self.wrap)
         self.y = next((i for i, row in enumerate(rows) if row.line >= top_line), 0)
         self._show_flags()
@@ -781,7 +1027,7 @@ class Viewer:
 
     def _count_text(self):
         """Position of the current match, e.g. "[2/5]"."""
-        key = (self.search_pattern, self.content.version)
+        key = (self.search_pattern, id(self.content), self.content.version)
         if self._count_key != key:
             all_matches = self.content.all_matches(self.search_pattern)
             self._found = list(islice(all_matches, MAX_COUNT + 1))
@@ -810,11 +1056,18 @@ class Viewer:
         )
         return flags or "-"
 
+    def _history_text(self):
+        """Position while browsing history, e.g. "3/47"."""
+        if self.cursor is None:
+            return ""
+        return f"{self.history.position(self.cursor)}/{len(self.history.ids) + 1}"
+
     def _corner(self, layout):
         """Bottom-right text: flags (briefly) and the search position."""
         parts = [self._corner_flags()]
         if self.highlighting and self.search_pattern:
             parts.append(self._count_text())
+        parts.append(self._history_text())
         text = " ".join(p for p in parts if p)
         return f" {text} "[-layout.cols :] if text else ""
 
@@ -850,26 +1103,38 @@ def terminal_session(mouse):
         write(MOUSE_DISABLE + AUTOWRAP_ON + SHOW_CURSOR + TITLE_POP + ALT_SCREEN_OFF)
 
 
-def event_loop(viewer, fifo, wake_read):
-    fifo_decoder = codecs.getincrementaldecoder("utf-8")("replace")
+def event_loop(viewer, source, wake_read, is_pty=False):
+    source_decoder = codecs.getincrementaldecoder("utf-8")("replace")
     stdin_decoder = codecs.getincrementaldecoder("utf-8")("ignore")
     draw_at = esc_at = None  # deadlines: pending FIFO draw / split escape
+    control = viewer.peers.fileno()
+    sources = [STDIN, source, wake_read] + ([control] if control is not None else [])
 
     viewer.draw()
     while True:
         flags_at = viewer.flags_deadline
         deadlines = [d for d in (draw_at, esc_at, flags_at) if d is not None]
         timeout = max(0.0, min(deadlines) - time.monotonic()) if deadlines else None
-        ready, _, _ = select.select([STDIN, fifo, wake_read], [], [], timeout)
+        ready, _, _ = select.select(sources, [], [], timeout)
         now = time.monotonic()
         redraw = False
 
-        if fifo in ready:
-            viewer.feed(fifo_decoder.decode(drain(fifo)))
-            if draw_at is None:  # fixed deadline: a steady stream can't starve drawing
-                draw_at = now + BURST_DELAY
+        # Read a new frame before applying a simultaneous history command.
+        if source in ready:
+            if text := source_decoder.decode(drain(source)):
+                viewer.feed(text)
+                if (
+                    draw_at is None
+                ):  # fixed deadline: a steady stream can't starve drawing
+                    draw_at = now + BURST_DELAY
+        if control is not None and control in ready:
+            for message in viewer.peers.receive():
+                viewer.handle_message(message)
+            redraw = True
         if wake_read in ready:  # resized
             drain(wake_read)
+            if is_pty:
+                sync_pty_size(source)
             viewer.invalidate()
             redraw = True
         if STDIN in ready:
@@ -893,8 +1158,10 @@ def event_loop(viewer, fifo, wake_read):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Terminal viewer for a FIFO.")
-    parser.add_argument("fifo")
+    parser = argparse.ArgumentParser(description="Terminal viewer for a FIFO or PTY.")
+    parser.add_argument(
+        "path", help="FIFO to read, or with --tty where to link the PTY"
+    )
     parser.add_argument("title", nargs="?", default="view")
     parser.add_argument("-f", "--follow", metavar="REGEX", help="center first match")
     parser.add_argument(
@@ -903,8 +1170,19 @@ def parse_args():
         default="buffer",
         help="how --follow searches (see docstring)",
     )
+    parser.add_argument(
+        "--follow-live",
+        action="store_true",
+        help="leave history when a new frame arrives",
+    )
     parser.add_argument("-m", "--mouse", action="store_true", help="capture mouse")
     parser.add_argument("-w", "--wrap", action="store_true", help="wrap long lines")
+    parser.add_argument(
+        "-t", "--tty", action="store_true", help="create a PTY linked at PATH"
+    )
+    parser.add_argument(
+        "-s", "--sync", metavar="DIR", help="sync states with sibling viewers"
+    )
     return parser.parse_args()
 
 
@@ -915,10 +1193,22 @@ def main():
         try:
             follow = re.compile(args.follow, re.MULTILINE)
         except re.error as error:
-            sys.exit(f"fifo.py: invalid --follow regex {args.follow!r}: {error}")
-    viewer = Viewer(args.title, follow, args.follow_mode, args.mouse, args.wrap)
+            sys.exit(f"viewer.py: invalid --follow regex {args.follow!r}: {error}")
+    peers = Peers(args.sync, args.title)
+    viewer = Viewer(
+        args.title,
+        follow,
+        args.follow_mode,
+        args.follow_live,
+        args.mouse,
+        args.wrap,
+        peers=peers,
+    )
 
-    fifo = os.open(args.fifo, os.O_RDWR | os.O_NONBLOCK)  # RDWR: never EOF
+    if args.tty:
+        source = open_pty(args.path)
+    else:
+        source = os.open(args.path, os.O_RDWR | os.O_NONBLOCK)  # RDWR: never EOF
     wake_read, wake_write = os.pipe()
     os.set_blocking(wake_read, False)
     os.set_blocking(wake_write, False)
@@ -927,8 +1217,13 @@ def main():
     for sig in (signal.SIGTERM, signal.SIGHUP):  # exit normally to restore the tty
         signal.signal(sig, lambda signum, _: sys.exit(128 + signum))
 
-    with suppress(KeyboardInterrupt), terminal_session(args.mouse):
-        event_loop(viewer, fifo, wake_read)
+    try:
+        with suppress(KeyboardInterrupt), terminal_session(args.mouse):
+            event_loop(viewer, source, wake_read, args.tty)
+    finally:
+        peers.close()
+        if args.tty:
+            Path(args.path).unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

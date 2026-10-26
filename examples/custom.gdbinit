@@ -7,6 +7,7 @@ set follow-fork-mode parent
 # Make sure you source tuimux after pwndbg is loaded
 source /path/to/tuimux/gdbinit.py
 python
+from tuimux import *
 @layout(opts={
     "context-code-lines": 1024,
     "context-stack-lines": 1024,
@@ -15,10 +16,11 @@ python
 def custom(ma):
     ba = view(ma, R, "25%", "backtrace", follow="►")
     di = view(ma, U, "80%", "disasm", follow="►")
-    io = open(di, R, "55%", "input/output", cmd="tty; tail -f /dev/null")
+    io = area(di, R, "55%", "input/output", cmd="tty; tail -f /dev/null")
     st = view(io, U, "75%", "stack")
-    rg = view(st, U, "60%", "regs").add("legend")
-    ip = open(ba, D, "30%", "ipython", cmd="ipython3")
+    re = view(st, U, "60%", "regs").add("legend")
+    ip = area(ba, D, "30%", "ipython", cmd="ipython3")
     co = view(di, D, "55%", "code", follow="►")
+    ba.add("threads", banner="top")
 end
 tuimux layout custom -y
